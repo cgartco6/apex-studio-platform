@@ -1,0 +1,946 @@
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+import json
+import heapq
+
+class TaskPriority(Enum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+class TaskStatus(Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    CANCELLED = "cancelled"
+
+@dataclass
+class Task:
+    id: str
+    title: str
+    description: str
+    priority: TaskPriority
+    estimated_hours: float
+    assigned_to: Optional[str] = None
+    dependencies: List[str] = field(default_factory=list)
+    status: TaskStatus = TaskStatus.PENDING
+    created_at: datetime = field(default_factory=datetime.now)
+    due_date: Optional[datetime] = None
+    start_date: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    actual_hours: float = 0.0
+    tags: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class Resource:
+    id: str
+    name: str
+    role: str
+    availability_hours: float = 40.0  # Weekly hours
+    skills: List[str] = field(default_factory=list)
+    current_load: float = 0.0
+    tasks: List[str] = field(default_factory=list)
+
+class TaskScheduler:
+    def __init__(self):
+        self.tasks: Dict[str, Task] = {}
+        self.resources: Dict[str, Resource] = {}
+        self.task_dependencies: Dict[str, List[str]] = {}
+        
+    def create_task(self, task_data: Dict) -> Task:
+        """Create a new task"""
+        task = Task(
+            id=task_data["id"],
+            title=task_data["title"],
+            description=task_data.get("description", ""),
+            priority=TaskPriority(task_data.get("priority", "medium")),
+            estimated_hours=task_data["estimated_hours"],
+            assigned_to=task_data.get("assigned_to"),
+            dependencies=task_data.get("dependencies", []),
+            tags=task_data.get("tags", []),
+            metadata=task_data.get("metadata", {})
+        )
+        
+        if "due_date" in task_data:
+            task.due_date = datetime.fromisoformat(task_data["due_date"])
+        
+        self.tasks[task.id] = task
+        
+        # Update dependency graph
+        for dep_id in task.dependencies:
+            if dep_id not in self.task_dependencies:
+                self.task_dependencies[dep_id] = []
+            self.task_dependencies[dep_id].append(task.id)
+        
+        return task
+    
+    def add_resource(self, resource_data: Dict) -> Resource:
+        """Add a resource to the scheduler"""
+        resource = Resource(
+            id=resource_data["id"],
+            name=resource_data["name"],
+            role=resource_data["role"],
+            availability_hours=resource_data.get("availability_hours", 40.0),
+            skills=resource_data.get("skills", [])
+        )
+        
+        self.resources[resource.id] = resource
+        return resource
+    
+    def schedule_tasks(self, start_date: datetime, weeks: int = 2) -> Dict:
+        """
+        Schedule tasks for the given time period using priority-based scheduling
+        """
+        schedule = {
+            "start_date": start_date.isoformat(),
+            "end_date": (start_date + timedelta(weeks=weeks)).isoformat(),
+            "weeks": weeks,
+            "resource_allocations": {},
+            "task_timeline": [],
+            "critical_path": [],
+            "metrics": {}
+        }
+        
+        # Get tasks ready for scheduling
+        ready_tasks = self._get_ready_tasks()
+        
+        # Sort tasks by priority and due date
+        sorted_tasks = self._prioritize_tasks(ready_tasks)
+        
+        # Initialize resource loads
+        for resource_id in self.resources:
+            schedule["resource_allocations"][resource_id] = {
+                "name": self.resources[resource_id].name,
+                "allocations": [],
+                "total_hours": 0,
+                "utilization": 0.0
+            }
+        
+        # Schedule tasks
+        current_date = start_date
+        week_hours = {resource_id: 0 for resource_id in self.resources}
+        
+        for task in sorted_tasks:
+            # Find suitable resource
+            resource_id = self._assign_resource(task, week_hours)
+            
+            if resource_id:
+                # Calculate task duration
+                task_duration = self._calculate_task_duration(task)
+                
+                # Schedule the task
+                task_schedule = {
+                    "task_id": task.id,
+                    "task_title": task.title,
+                    "priority": task.priority.value,
+                    "resource_id": resource_id,
+                    "resource_name": self.resources[resource_id].name,
+                    "start_date": current_date.isoformat(),
+                    "end_date": (current_date + timedelta(days=task_duration)).isoformat(),
+                    "estimated_hours": task.estimated_hours,
+                    "duration_days": task_duration
+                }
+                
+                schedule["task_timeline"].append(task_schedule)
+                
+                # Update resource allocation
+                schedule["resource_allocations"][resource_id]["allocations"].append(task_schedule)
+                schedule["resource_allocations"][resource_id]["total_hours"] += task.estimated_hours
+                
+                # Update week hours
+                week_hours[resource_id] += task.estimated_hours
+                
+                # Update task status
+                task.status = TaskStatus.IN_PROGRESS
+                task.start_date = current_date
+                
+                # Move current date forward for next task
+                current_date += timedelta(days=task_duration)
+        
+        # Calculate critical path
+        schedule["critical_path"] = self._calculate_critical_path()
+        
+        # Calculate metrics
+        schedule["metrics"] = self._calculate_schedule_metrics(schedule)
+        
+        return schedule
+    
+    def _get_ready_tasks(self) -> List[Task]:
+        """Get tasks that are ready to be scheduled (dependencies met)"""
+        ready_tasks = []
+        
+        for task_id, task in self.tasks.items():
+            if task.status == TaskStatus.PENDING:
+                # Check if all dependencies are completed
+                dependencies_met = all(
+                    self.tasks[dep_id].status == TaskStatus.COMPLETED
+                    for dep_id in task.dependencies
+                    if dep_id in self.tasks
+                )
+                
+                if dependencies_met:
+                    ready_tasks.append(task)
+        
+        return ready_tasks
+    
+    def _prioritize_tasks(self, tasks: List[Task]) -> List[Task]:
+        """Prioritize tasks based on multiple factors"""
+        
+        def task_score(task: Task) -> tuple:
+            # Priority weights
+            priority_weights = {
+                TaskPriority.CRITICAL: 4,
+                TaskPriority.HIGH: 3,
+                TaskPriority.MEDIUM: 2,
+                TaskPriority.LOW: 1
+            }
+            
+            # Calculate urgency based on due date
+            urgency = 0
+            if task.due_date:
+                days_until_due = (task.due_date - datetime.now()).days
+                if days_until_due <= 0:
+                    urgency = 100  # Overdue
+                elif days_until_due <= 3:
+                    urgency = 80   # Due soon
+                elif days_until_due <= 7:
+                    urgency = 60   # Due in a week
+                elif days_until_due <= 14:
+                    urgency = 40   # Due in two weeks
+            
+            # Calculate dependency weight
+            dependency_weight = len(task.dependencies) * 10
+            
+            # Combined score
+            score = (
+                priority_weights[task.priority] * 25 +
+                urgency * 0.5 +
+                dependency_weight
+            )
+            
+            return (-score, task.due_date or datetime.max)
+        
+        return sorted(tasks, key=task_score)
+    
+    def _assign_resource(self, task: Task, week_hours: Dict[str, float]) -> Optional[str]:
+        """Assign the best available resource for a task"""
+        suitable_resources = []
+        
+        for resource_id, resource in self.resources.items():
+            # Check if resource has required skills
+            if task.tags and not any(skill in resource.skills for skill in task.tags):
+                continue
+            
+            # Check resource availability
+            available_hours = resource.availability_hours - week_hours.get(resource_id, 0)
+            
+            if available_hours >= task.estimated_hours:
+                # Calculate suitability score
+                skill_match = len(set(task.tags) & set(resource.skills))
+                current_load = resource.current_load
+                
+                score = (
+                    skill_match * 40 +
+                    (resource.availability_hours - current_load) * 30 +
+                    available_hours * 30
+                )
+                
+                suitable_resources.append((score, resource_id))
+        
+        if suitable_resources:
+            # Select resource with highest score
+            suitable_resources.sort(reverse=True)
+            return suitable_resources[0][1]
+        
+        return None
+    
+    def _calculate_task_duration(self, task: Task) -> int:
+        """Calculate task duration in days based on estimated hours"""
+        # Assuming 8-hour work days
+        hours_per_day = 8
+        duration_days = max(1, int(task.estimated_hours / hours_per_day))
+        
+        # Adjust for priority
+        if task.priority == TaskPriority.CRITICAL:
+            duration_days = max(1, duration_days // 2)  # Critical tasks get expedited
+        elif task.priority == TaskPriority.LOW:
+            duration_days = duration_days * 2  # Low priority tasks can take longer
+        
+        return duration_days
+    
+    def _calculate_critical_path(self) -> List[Dict]:
+        """Calculate the critical path for project completion"""
+        # This is a simplified critical path calculation
+        critical_tasks = []
+        
+        # Find tasks with no dependents
+        end_tasks = []
+        for task_id, task in self.tasks.items():
+            if task_id not in self.task_dependencies or not self.task_dependencies[task_id]:
+                end_tasks.append(task)
+        
+        # Trace back dependencies to find critical path
+        for task in end_tasks:
+            path = self._trace_critical_path(task)
+            if len(path) > len(critical_tasks):
+                critical_tasks = path
+        
+        return [
+            {
+                "task_id": task.id,
+                "task_title": task.title,
+                "priority": task.priority.value,
+                "estimated_hours": task.estimated_hours
+            }
+            for task in critical_tasks
+        ]
+    
+    def _trace_critical_path(self, task: Task) -> List[Task]:
+        """Trace critical path from a given task"""
+        path = [task]
+        
+        if task.dependencies:
+            # Find the dependency with longest estimated time
+            longest_dep = None
+            max_hours = 0
+            
+            for dep_id in task.dependencies:
+                if dep_id in self.tasks:
+                    dep_task = self.tasks[dep_id]
+                    if dep_task.estimated_hours > max_hours:
+                        max_hours = dep_task.estimated_hours
+                        longest_dep = dep_task
+            
+            if longest_dep:
+                path.extend(self._trace_critical_path(longest_dep))
+        
+        return path
+    
+    def _calculate_schedule_metrics(self, schedule: Dict) -> Dict:
+        """Calculate schedule metrics"""
+        total_tasks = len(self.tasks)
+        scheduled_tasks = len(schedule["task_timeline"])
+        
+        # Calculate resource utilization
+        resource_metrics = {}
+        for resource_id, allocation in schedule["resource_allocations"].items():
+            resource = self.resources[resource_id]
+            utilization = (allocation["total_hours"] / (resource.availability_hours * schedule["weeks"])) * 100
+            
+            resource_metrics[resource_id] = {
+                "name": resource.name,
+                "utilization": round(utilization, 2),
+                "allocated_hours": allocation["total_hours"],
+                "available_hours": resource.availability_hours * schedule["weeks"]
+            }
+        
+        # Calculate schedule efficiency
+        total_estimated_hours = sum(task.estimated_hours for task in self.tasks.values())
+        scheduled_hours = sum(allocation["total_hours"] for allocation in schedule["resource_allocations"].values())
+        
+        efficiency = (scheduled_hours / total_estimated_hours * 100) if total_estimated_hours > 0 else 0
+        
+        # Calculate completion rate
+        completed_tasks = sum(1 for task in self.tasks.values() if task.status == TaskStatus.COMPLETED)
+        completion_rate = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
+        
+        return {
+            "total_tasks": total_tasks,
+            "scheduled_tasks": scheduled_tasks,
+            "unscheduled_tasks": total_tasks - scheduled_tasks,
+            "completion_rate": round(completion_rate, 2),
+            "schedule_efficiency": round(efficiency, 2),
+            "resource_utilization": resource_metrics,
+            "total_estimated_hours": total_estimated_hours,
+            "scheduled_hours": scheduled_hours
+        }
+    
+    def update_task_status(self, task_id: str, status: TaskStatus, actual_hours: Optional[float] = None) -> Task:
+        """Update task status and actual hours"""
+        if task_id not in self.tasks:
+            raise ValueError(f"Task {task_id} not found")
+        
+        task = self.tasks[task_id]
+        task.status = status
+        
+        if status == TaskStatus.COMPLETED:
+            task.completed_at = datetime.now()
+            if actual_hours is not None:
+                task.actual_hours = actual_hours
+        
+        # Update resource load if task was assigned
+        if task.assigned_to and task.assigned_to in self.resources:
+            resource = self.resources[task.assigned_to]
+            if status == TaskStatus.COMPLETED:
+                resource.current_load -= task.estimated_hours
+            elif status == TaskStatus.IN_PROGRESS:
+                resource.current_load += task.estimated_hours
+        
+        return task
+    
+    def get_task_recommendations(self, task_id: str) -> Dict:
+        """Get recommendations for optimizing a specific task"""
+        if task_id not in self.tasks:
+            raise ValueError(f"Task {task_id} not found")
+        
+        task = self.tasks[task_id]
+        recommendations = {
+            "task_id": task_id,
+            "task_title": task.title,
+            "current_status": task.status.value,
+            "recommendations": [],
+            "risks": [],
+            "optimizations": []
+        }
+        
+        # Check dependencies
+        for dep_id in task.dependencies:
+            if dep_id in self.tasks:
+                dep_task = self.tasks[dep_id]
+                if dep_task.status != TaskStatus.COMPLETED:
+                    recommendations["risks"].append({
+                        "type": "dependency",
+                        "message": f"Depends on uncompleted task: {dep_task.title}",
+                        "severity": "high" if task.priority == TaskPriority.CRITICAL else "medium"
+                    })
+        
+        # Check resource allocation
+        if not task.assigned_to:
+            recommendations["recommendations"].append({
+                "type": "resource",
+                "message": "Assign a resource to this task",
+                "priority": "high"
+            })
+        else:
+            resource = self.resources.get(task.assigned_to)
+            if resource:
+                # Check if resource is overloaded
+                if resource.current_load > resource.availability_hours * 0.8:
+                    recommendations["risks"].append({
+                        "type": "resource",
+                        "message": f"Assigned resource {resource.name} is overloaded",
+                        "severity": "medium"
+                    })
+        
+        # Check timeline
+        if task.due_date:
+            days_until_due = (task.due_date - datetime.now()).days
+            
+            if days_until_due < 0:
+                recommendations["risks"].append({
+                    "type": "timeline",
+                    "message": "Task is overdue",
+                    "severity": "critical"
+                })
+            elif days_until_due < task.estimated_hours / 8:  # Convert hours to days
+                recommendations["risks"].append({
+                    "type": "timeline",
+                    "message": "Insufficient time to complete task",
+                    "severity": "high"
+                })
+        
+        # Suggest optimizations
+        if task.estimated_hours > 40:  # Large tasks
+            recommendations["optimizations"].append({
+                "type": "breakdown",
+                "message": "Consider breaking down into smaller subtasks",
+                "benefit": "Better tracking and parallel execution"
+            })
+        
+        if len(task.dependencies) > 3:
+            recommendations["optimizations"].append({
+                "type": "dependencies",
+                "message": "Reduce dependency complexity",
+                "benefit": "Faster task initiation"
+            })
+        
+        # Calculate priority adjustment
+        if task.priority == TaskPriority.LOW and task.due_date and days_until_due < 7:
+            recommendations["recommendations"].append({
+                "type": "priority",
+                "message": "Consider increasing task priority",
+                "reason": "Approaching deadline"
+            })
+        
+        return recommendations
+    
+    def generate_report(self, report_type: str = "weekly") -> Dict:
+        """Generate scheduling report"""
+        now = datetime.now()
+        
+        if report_type == "weekly":
+            start_date = now - timedelta(days=7)
+            end_date = now
+        elif report_type == "monthly":
+            start_date = now - timedelta(days=30)
+            end_date = now
+        else:
+            start_date = now - timedelta(days=1)
+            end_date = now
+        
+        # Filter tasks in the period
+        period_tasks = []
+        for task in self.tasks.values():
+            if task.start_date and start_date <= task.start_date <= end_date:
+                period_tasks.append(task)
+            elif task.completed_at and start_date <= task.completed_at <= end_date:
+                period_tasks.append(task)
+        
+        # Calculate metrics
+        completed_tasks = [t for t in period_tasks if t.status == TaskStatus.COMPLETED]
+        in_progress_tasks = [t for t in period_tasks if t.status == TaskStatus.IN_PROGRESS]
+        
+        total_estimated = sum(t.estimated_hours for t in period_tasks)
+        total_actual = sum(t.actual_hours for t in completed_tasks)
+        
+        # Calculate efficiency
+        efficiency = (total_estimated / total_actual * 100) if total_actual > 0 else 0
+        
+        # Resource performance
+        resource_performance = {}
+        for resource_id, resource in self.resources.items():
+            resource_tasks = [t for t in period_tasks if t.assigned_to == resource_id]
+            
+            if resource_tasks:
+                completed_resource_tasks = [t for t in resource_tasks if t.status == TaskStatus.COMPLETED]
+                
+                completion_rate = (len(completed_resource_tasks) / len(resource_tasks) * 100) if resource_tasks else 0
+                
+                estimated_hours = sum(t.estimated_hours for t in resource_tasks)
+                actual_hours = sum(t.actual_hours for t in completed_resource_tasks)
+                
+                resource_efficiency = (estimated_hours / actual_hours * 100) if actual_hours > 0 else 0
+                
+                resource_performance[resource_id] = {
+                    "name": resource.name,
+                    "tasks_assigned": len(resource_tasks),
+                    "tasks_completed": len(completed_resource_tasks),
+                    "completion_rate": round(completion_rate, 2),
+                    "estimated_hours": estimated_hours,
+                    "actual_hours": actual_hours,
+                    "efficiency": round(resource_efficiency, 2)
+                }
+        
+        report = {
+            "report_type": report_type,
+            "period": {
+                "start": start_date.isoformat(),
+                "end": end_date.isoformat()
+            },
+            "summary": {
+                "total_tasks": len(period_tasks),
+                "completed_tasks": len(completed_tasks),
+                "in_progress_tasks": len(in_progress_tasks),
+                "completion_rate": round((len(completed_tasks) / len(period_tasks) * 100) if period_tasks else 0, 2),
+                "total_estimated_hours": total_estimated,
+                "total_actual_hours": total_actual,
+                "overall_efficiency": round(efficiency, 2)
+            },
+            "resource_performance": resource_performance,
+            "task_distribution": {
+                "by_priority": self._get_task_distribution_by_priority(period_tasks),
+                "by_status": self._get_task_distribution_by_status(period_tasks)
+            },
+            "recommendations": self._generate_report_recommendations(period_tasks, resource_performance)
+        }
+        
+        return report
+    
+    def _get_task_distribution_by_priority(self, tasks: List[Task]) -> Dict:
+        """Get task distribution by priority"""
+        distribution = {
+            "critical": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0
+        }
+        
+        for task in tasks:
+            distribution[task.priority.value] += 1
+        
+        return distribution
+    
+    def _get_task_distribution_by_status(self, tasks: List[Task]) -> Dict:
+        """Get task distribution by status"""
+        distribution = {
+            "pending": 0,
+            "in_progress": 0,
+            "completed": 0,
+            "blocked": 0,
+            "cancelled": 0
+        }
+        
+        for task in tasks:
+            distribution[task.status.value] += 1
+        
+        return distribution
+    
+    def _generate_report_recommendations(self, tasks: List[Task], resource_performance: Dict) -> List[Dict]:
+        """Generate recommendations based on report data"""
+        recommendations = []
+        
+        # Check for overdue tasks
+        overdue_tasks = [
+            t for t in tasks 
+            if t.due_date and t.due_date < datetime.now() and t.status != TaskStatus.COMPLETED
+        ]
+        
+        if overdue_tasks:
+            recommendations.append({
+                "type": "overdue",
+                "message": f"{len(overdue_tasks)} tasks are overdue",
+                "action": "Review and reprioritize overdue tasks",
+                "priority": "high"
+            })
+        
+        # Check resource utilization
+        for resource_id, performance in resource_performance.items():
+            if performance["efficiency"] < 80:
+                recommendations.append({
+                    "type": "resource_efficiency",
+                    "message": f"Low efficiency for {performance['name']}",
+                    "action": "Review task assignments and provide support",
+                    "priority": "medium"
+                })
+        
+        # Check task size distribution
+        large_tasks = [t for t in tasks if t.estimated_hours > 40]
+        if len(large_tasks) > len(tasks) * 0.3:  # More than 30% are large tasks
+            recommendations.append({
+                "type": "task_size",
+                "message": "High percentage of large tasks",
+                "action": "Break down large tasks into smaller, manageable pieces",
+                "priority": "medium"
+            })
+        
+        return recommendations
+    
+    def optimize_schedule(self, current_schedule: Dict) -> Dict:
+        """Optimize the current schedule"""
+        optimized_schedule = current_schedule.copy()
+        
+        # Identify bottlenecks
+        bottlenecks = self._identify_bottlenecks(current_schedule)
+        
+        # Apply optimization strategies
+        optimizations = []
+        
+        for bottleneck in bottlenecks:
+            if bottleneck["type"] == "resource_overload":
+                optimization = self._optimize_resource_overload(bottleneck)
+                optimizations.append(optimization)
+            
+            elif bottleneck["type"] == "task_dependency":
+                optimization = self._optimize_task_dependency(bottleneck)
+                optimizations.append(optimization)
+        
+        # Apply optimizations to schedule
+        optimized_schedule["optimizations"] = optimizations
+        optimized_schedule["metrics"]["after_optimization"] = self._calculate_schedule_metrics(optimized_schedule)
+        
+        return optimized_schedule
+    
+    def _identify_bottlenecks(self, schedule: Dict) -> List[Dict]:
+        """Identify bottlenecks in the schedule"""
+        bottlenecks = []
+        
+        # Check resource overload
+        for resource_id, allocation in schedule["resource_allocations"].items():
+            if allocation["total_hours"] > self.resources[resource_id].availability_hours * schedule["weeks"]:
+                bottlenecks.append({
+                    "type": "resource_overload",
+                    "resource_id": resource_id,
+                    "resource_name": allocation["name"],
+                    "overload_hours": allocation["total_hours"] - self.resources[resource_id].availability_hours * schedule["weeks"],
+                    "severity": "high"
+                })
+        
+        # Check task dependencies
+        for task in schedule["task_timeline"]:
+            task_obj = self.tasks[task["task_id"]]
+            if task_obj.dependencies:
+                # Check if dependencies cause delays
+                dependency_delays = self._check_dependency_delays(task_obj, schedule)
+                if dependency_delays:
+                    bottlenecks.append({
+                        "type": "task_dependency",
+                        "task_id": task_obj.id,
+                        "task_title": task_obj.title,
+                        "delays": dependency_delays,
+                        "severity": "medium"
+                    })
+        
+        return bottlenecks
+    
+    def _check_dependency_delays(self, task: Task, schedule: Dict) -> List[Dict]:
+        """Check if dependencies cause delays"""
+        delays = []
+        
+        for dep_id in task.dependencies:
+            if dep_id in self.tasks:
+                dep_task = self.tasks[dep_id]
+                
+                # Find dependency in schedule
+                dep_schedule = next(
+                    (t for t in schedule["task_timeline"] if t["task_id"] == dep_id),
+                    None
+                )
+                
+                if dep_schedule:
+                    dep_end_date = datetime.fromisoformat(dep_schedule["end_date"])
+                    task_start_date = datetime.fromisoformat(
+                        next(t["start_date"] for t in schedule["task_timeline"] if t["task_id"] == task.id)
+                    )
+                    
+                    if dep_end_date > task_start_date:
+                        delay_days = (dep_end_date - task_start_date).days
+                        delays.append({
+                            "dependency_id": dep_id,
+                            "dependency_title": dep_task.title,
+                            "delay_days": delay_days
+                        })
+        
+        return delays
+    
+    def _optimize_resource_overload(self, bottleneck: Dict) -> Dict:
+        """Optimize resource overload bottleneck"""
+        resource_id = bottleneck["resource_id"]
+        overload_hours = bottleneck["overload_hours"]
+        
+        # Get tasks assigned to this resource
+        resource_tasks = [
+            task for task in self.tasks.values()
+            if task.assigned_to == resource_id and task.status != TaskStatus.COMPLETED
+        ]
+        
+        # Sort tasks by priority (lowest first for potential reassignment)
+        resource_tasks.sort(key=lambda t: (
+            0 if t.priority == TaskPriority.CRITICAL else
+            1 if t.priority == TaskPriority.HIGH else
+            2 if t.priority == TaskPriority.MEDIUM else 3
+        ))
+        
+        optimizations = []
+        remaining_overload = overload_hours
+        
+        for task in resource_tasks:
+            if remaining_overload <= 0:
+                break
+            
+            # Try to reassign task
+            available_resources = [
+                r for r in self.resources.values()
+                if r.id != resource_id and
+                r.current_load + task.estimated_hours <= r.availability_hours and
+                any(skill in r.skills for skill in task.tags)
+            ]
+            
+            if available_resources:
+                # Sort by suitability
+                available_resources.sort(
+                    key=lambda r: len(set(task.tags) & set(r.skills)),
+                    reverse=True
+                )
+                
+                best_resource = available_resources[0]
+                
+                # Reassign task
+                task.assigned_to = best_resource.id
+                best_resource.current_load += task.estimated_hours
+                
+                # Update original resource load
+                original_resource = self.resources[resource_id]
+                original_resource.current_load -= task.estimated_hours
+                
+                optimizations.append({
+                    "task_id": task.id,
+                    "task_title": task.title,
+                    "from_resource": resource_id,
+                    "to_resource": best_resource.id,
+                    "hours_reallocated": task.estimated_hours
+                })
+                
+                remaining_overload -= task.estimated_hours
+        
+        return {
+            "bottleneck_type": bottleneck["type"],
+            "resource": bottleneck["resource_name"],
+            "original_overload": overload_hours,
+            "remaining_overload": max(0, remaining_overload),
+            "optimizations_applied": optimizations
+        }
+    
+    def _optimize_task_dependency(self, bottleneck: Dict) -> Dict:
+        """Optimize task dependency bottleneck"""
+        task_id = bottleneck["task_id"]
+        task = self.tasks[task_id]
+        
+        optimizations = []
+        
+        for delay in bottleneck["delays"]:
+            dep_id = delay["dependency_id"]
+            dep_task = self.tasks[dep_id]
+            
+            # Try to expedite dependency task
+            if dep_task.priority != TaskPriority.CRITICAL:
+                # Increase priority
+                original_priority = dep_task.priority
+                dep_task.priority = TaskPriority.HIGH
+                
+                # Reassign to more efficient resource if possible
+                if dep_task.assigned_to:
+                    current_resource = self.resources[dep_task.assigned_to]
+                    
+                    # Find potentially faster resource
+                    faster_resources = [
+                        r for r in self.resources.values()
+                        if r.id != dep_task.assigned_to and
+                        r.current_load < current_resource.current_load and
+                        any(skill in r.skills for skill in dep_task.tags)
+                    ]
+                    
+                    if faster_resources:
+                        faster_resources.sort(key=lambda r: r.current_load)
+                        new_resource = faster_resources[0]
+                        
+                        # Reassign
+                        current_resource.current_load -= dep_task.estimated_hours
+                        new_resource.current_load += dep_task.estimated_hours
+                        dep_task.assigned_to = new_resource.id
+                        
+                        optimizations.append({
+                            "dependency_id": dep_id,
+                            "dependency_title": dep_task.title,
+                            "action": "reassigned",
+                            "from_resource": current_resource.id,
+                            "to_resource": new_resource.id,
+                            "priority_increased": True
+                        })
+                    else:
+                        optimizations.append({
+                            "dependency_id": dep_id,
+                            "dependency_title": dep_task.title,
+                            "action": "priority_increased",
+                            "from_priority": original_priority.value,
+                            "to_priority": dep_task.priority.value
+                        })
+        
+        return {
+            "bottleneck_type": bottleneck["type"],
+            "task": task.title,
+            "delays_resolved": len(optimizations),
+            "optimizations_applied": optimizations
+        }
+
+# Example usage
+if __name__ == "__main__":
+    # Create task scheduler
+    scheduler = TaskScheduler()
+    
+    # Add resources
+    resources = [
+        {
+            "id": "R1",
+            "name": "John Designer",
+            "role": "Senior Designer",
+            "availability_hours": 40,
+            "skills": ["UI/UX", "Illustration", "Branding"]
+        },
+        {
+            "id": "R2",
+            "name": "Sarah Developer",
+            "role": "Frontend Developer",
+            "availability_hours": 35,
+            "skills": ["React", "JavaScript", "CSS"]
+        },
+        {
+            "id": "R3",
+            "name": "Mike PM",
+            "role": "Project Manager",
+            "availability_hours": 45,
+            "skills": ["Planning", "Coordination", "Documentation"]
+        }
+    ]
+    
+    for resource in resources:
+        scheduler.add_resource(resource)
+    
+    # Create tasks
+    tasks = [
+        {
+            "id": "T1",
+            "title": "Design Homepage",
+            "description": "Create homepage design with responsive layout",
+            "priority": "high",
+            "estimated_hours": 16,
+            "tags": ["UI/UX", "Design"],
+            "dependencies": []
+        },
+        {
+            "id": "T2",
+            "title": "Implement Header Component",
+            "description": "Code responsive header with navigation",
+            "priority": "medium",
+            "estimated_hours": 8,
+            "tags": ["React", "JavaScript"],
+            "dependencies": ["T1"]
+        },
+        {
+            "id": "T3",
+            "title": "Create Brand Guidelines",
+            "description": "Document brand colors, typography, and usage",
+            "priority": "critical",
+            "estimated_hours": 24,
+            "tags": ["Branding", "Documentation"],
+            "dependencies": []
+        },
+        {
+            "id": "T4",
+            "title": "Design Mobile App Screens",
+            "description": "Create wireframes for mobile app",
+            "priority": "high",
+            "estimated_hours": 20,
+            "tags": ["UI/UX", "Mobile"],
+            "dependencies": ["T3"]
+        },
+        {
+            "id": "T5",
+            "title": "Project Documentation",
+            "description": "Create comprehensive project documentation",
+            "priority": "low",
+            "estimated_hours": 12,
+            "tags": ["Documentation"],
+            "dependencies": ["T2", "T4"],
+            "due_date": (datetime.now() + timedelta(days=14)).isoformat()
+        }
+    ]
+    
+    for task in tasks:
+        scheduler.create_task(task)
+    
+    # Schedule tasks for next 2 weeks
+    start_date = datetime.now()
+    schedule = scheduler.schedule_tasks(start_date, weeks=2)
+    
+    print("Initial Schedule:")
+    print(json.dumps(schedule, indent=2))
+    
+    # Get recommendations for a specific task
+    recommendations = scheduler.get_task_recommendations("T5")
+    print("\nTask Recommendations:")
+    print(json.dumps(recommendations, indent=2))
+    
+    # Generate weekly report
+    report = scheduler.generate_report("weekly")
+    print("\nWeekly Report:")
+    print(json.dumps(report, indent=2))
+    
+    # Optimize schedule
+    optimized = scheduler.optimize_schedule(schedule)
+    print("\nOptimized Schedule:")
+    print(json.dumps(optimized, indent=2))
